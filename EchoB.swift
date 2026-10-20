@@ -17,6 +17,10 @@ let paramSampleRate: UInt32 = 62                // index matches slotRates numbe
 let slotRates: [(UInt32, Double)] = [(4, 44100), (5, 48000), (6, 96000), (7, 192000), (8, 384000)]
 let filterNames = [0: "Peak", 1: "Low shelf", 2: "High shelf", 3: "Low pass", 4: "High pass"]
 let gainRange = -12.0...12.0, freqRange = 20.0...20000.0, qRange = 0.2...10.0
+let standardFreqs = [63, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]
+let standardQ = (2.0.squareRoot() * 256).rounded() / 256     // device stores q·256
+
+func hz(_ f: Int) -> String { f >= 1000 ? String(format: "%.2fk", Double(f) / 1000) : "\(f)" }
 
 func cafID(_ name: String) -> UInt32 {
     let b = name.utf8.map { UInt32($0) - 32 }
@@ -234,8 +238,11 @@ final class Model: ObservableObject {
 
     func revert() { bands = savedBands }
 
-    func resetFlat() {
-        for i in bands.indices { bands[i].gain = 0 }
+    /// Standard 9-band graphic EQ layout: ISO 266 octave centers, one-octave bandwidth (Q √2), 0 dB.
+    func resetStandard() {
+        for (i, f) in zip(bands.indices, standardFreqs) {
+            (bands[i].freq, bands[i].q, bands[i].gain) = (f, standardQ, 0)
+        }
     }
 
     // Runs a device action off the main thread, then re-reads state.
@@ -276,7 +283,8 @@ struct ResponseGraph: View {
     private func fx(_ x: Double, _ w: Double) -> Double {
         min(max(freqRange.lowerBound * pow(1000, x / w), freqRange.lowerBound), freqRange.upperBound)
     }
-    private func py(_ db: Double, _ h: Double) -> Double { (gainRange.upperBound - db) / 24 * h }
+    private let span = 14.0                     // ±dB shown, headroom so ±12 labels aren't clipped
+    private func py(_ db: Double, _ h: Double) -> Double { (span - db) / (2 * span) * h }
 
     var body: some View {
         GeometryReader { geo in
@@ -291,8 +299,8 @@ struct ResponseGraph: View {
                 for db in stride(from: -12.0, through: 12, by: 6) {
                     var p = Path(); p.move(to: CGPoint(x: 0, y: py(db, h))); p.addLine(to: CGPoint(x: w, y: py(db, h)))
                     ctx.stroke(p, with: .color(.secondary.opacity(db == 0 ? 0.4 : 0.15)))
-                    ctx.draw(Text("\(Int(db))").font(.system(size: 9)).foregroundStyle(.secondary),
-                             at: CGPoint(x: 10, y: py(db, h) - 7))
+                    ctx.draw(Text(db > 0 ? "+\(Int(db))" : "\(Int(db))").font(.system(size: 9)).foregroundStyle(.secondary),
+                             at: CGPoint(x: 12, y: py(db, h) - 7))
                 }
                 var curve = Path()
                 for sx in stride(from: 0.0, through: w, by: 2) {
@@ -301,13 +309,23 @@ struct ResponseGraph: View {
                     let pt = CGPoint(x: sx, y: py(db, h))
                     if sx == 0 { curve.move(to: pt) } else { curve.addLine(to: pt) }
                 }
+                var area = curve
+                area.addLine(to: CGPoint(x: w, y: py(0, h))); area.addLine(to: CGPoint(x: 0, y: py(0, h))); area.closeSubpath()
+                ctx.fill(area, with: .color(.accentColor.opacity(0.12)))
                 ctx.stroke(curve, with: .color(.accentColor), lineWidth: 2)
                 for (i, b) in bands.enumerated() where fixed == nil {
                     let c = CGPoint(x: px(Double(b.freq), w), y: py(Double(b.gain), h))
                     let r: Double = dragging == i ? 9 : 7
                     let dot = Path(ellipseIn: CGRect(x: c.x - r, y: c.y - r, width: 2 * r, height: 2 * r))
                     ctx.fill(dot, with: .color(b.gain == 0 ? .gray : .accentColor))
+                    if dragging == i { ctx.stroke(dot, with: .color(.white), lineWidth: 2) }
                     ctx.draw(Text("\(b.id)").font(.system(size: 9, weight: .bold)).foregroundStyle(.white), at: c)
+                }
+                if let i = dragging, fixed == nil, bands.indices.contains(i) {
+                    let b = bands[i]
+                    ctx.draw(Text("Band \(b.id) · \(hz(b.freq)) Hz · \(b.gain > 0 ? "+" : "")\(b.gain) dB · Q \(String(format: "%.2f", b.q))")
+                                .font(.caption.monospacedDigit()).foregroundStyle(.secondary),
+                             at: CGPoint(x: w / 2, y: 12))
                 }
             }
             .contentShape(Rectangle())
@@ -325,7 +343,7 @@ struct ResponseGraph: View {
                     }
                     guard let i = dragging else { return }
                     bands[i].freq = Int(fx(g.location.x, w).rounded())
-                    bands[i].gain = Int((gainRange.upperBound - g.location.y / h * 24).rounded()).clamped(to: -12...12)
+                    bands[i].gain = Int((span - g.location.y / h * 2 * span).rounded()).clamped(to: -12...12)
                 }
                 .onEnded { _ in
                     dragging = nil
@@ -341,6 +359,7 @@ extension Comparable {
 
 struct BandRow: View {
     @Binding var band: Band
+    var active = false                          // being dragged in the graph
 
     private var logFreq: Binding<Double> {
         Binding(get: { log10(Double(band.freq)) }, set: { band.freq = Int(pow(10, $0).rounded()) })
@@ -351,21 +370,62 @@ struct BandRow: View {
     private var gain: Binding<Double> {
         Binding(get: { Double(band.gain) }, set: { band.gain = Int($0.rounded()) })
     }
+    // typed values, clamped to what the device takes
+    private var freqField: Binding<Int> {
+        Binding(get: { band.freq }, set: { band.freq = $0.clamped(to: Int(freqRange.lowerBound)...Int(freqRange.upperBound)) })
+    }
+    private var gainField: Binding<Int> {
+        Binding(get: { band.gain }, set: { band.gain = $0.clamped(to: Int(gainRange.lowerBound)...Int(gainRange.upperBound)) })
+    }
+    private var qField: Binding<Double> {
+        Binding(get: { band.q }, set: { band.q = ($0.clamped(to: qRange) * 256).rounded() / 256 })
+    }
+    private func field<F: ParseableFormatStyle>(_ value: Binding<F.FormatInput>, _ format: F, width: CGFloat) -> some View
+    where F.FormatOutput == String {
+        TextField("", value: value, format: format)
+            .textFieldStyle(.roundedBorder).multilineTextAlignment(.trailing).frame(width: width)
+    }
     var body: some View {
         GridRow {
-            Text("\(band.id)").font(.callout.bold()).foregroundStyle(.secondary)
+            Text("\(band.id)").font(.callout.bold()).foregroundStyle(active ? Color.accentColor : .secondary)
             Slider(value: logFreq, in: log10(freqRange.lowerBound)...log10(freqRange.upperBound))
-            Text(band.freq >= 1000 ? String(format: "%.2fk", Double(band.freq) / 1000) : "\(band.freq)")
-                .frame(width: 48, alignment: .trailing)
-            Slider(value: gain, in: gainRange, step: 1)
-            Text("\(band.gain > 0 ? "+" : "")\(band.gain) dB")
-                .foregroundStyle(band.gain == 0 ? Color.secondary : Color.primary)
-                .frame(width: 48, alignment: .trailing)
+            field(freqField, IntegerFormatStyle<Int>().grouping(.never), width: 62)
+            Slider(value: gain, in: gainRange)
+            field(gainField, IntegerFormatStyle<Int>().sign(strategy: .always(includingZero: false)), width: 44)
             Slider(value: logQ, in: log10(qRange.lowerBound)...log10(qRange.upperBound))
-            Text(String(format: "%.2f", band.q)).frame(width: 36, alignment: .trailing)
+            field(qField, FloatingPointFormatStyle<Double>().precision(.fractionLength(2)), width: 50)
         }
         .monospacedDigit()
         .font(.callout)
+    }
+}
+
+/// SwiftUI's segmented Picker makes every segment as wide as "Custom"; this one fits each label.
+struct PresetControl: NSViewRepresentable {
+    let labels: [String]
+    var selected: Int?
+    let onSelect: (Int) -> Void
+
+    func makeNSView(context: Context) -> NSSegmentedControl {
+        let c = NSSegmentedControl(labels: labels, trackingMode: .selectOne,
+                                   target: context.coordinator, action: #selector(Coordinator.changed(_:)))
+        c.segmentDistribution = .fit
+        for i in labels.indices.dropFirst() { c.setWidth(34, forSegment: i) }
+        return c
+    }
+
+    func updateNSView(_ c: NSSegmentedControl, context: Context) {
+        context.coordinator.onSelect = onSelect
+        c.selectedSegment = selected ?? -1
+        c.isEnabled = context.environment.isEnabled
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(onSelect) }
+
+    final class Coordinator: NSObject {
+        var onSelect: (Int) -> Void
+        init(_ onSelect: @escaping (Int) -> Void) { self.onSelect = onSelect }
+        @objc func changed(_ c: NSSegmentedControl) { onSelect(c.selectedSegment) }
     }
 }
 
@@ -387,16 +447,10 @@ struct ContentView: View {
                     .help("Re-read device")
             }
 
-            HStack(spacing: 8) {
-                Text("Preset").font(.subheadline).foregroundStyle(.secondary).frame(width: 50, alignment: .leading)
-                ForEach(Array(presets), id: \.self) { i in
-                    Button { m.select(i) } label: { Text(i == 0 ? "Custom" : "\(i)").frame(minWidth: 40) }
-                        .buttonStyle(.borderedProminent)
-                        .tint(i == m.preset ? .accentColor : .gray.opacity(0.35))
-                        .help(i == 0 ? "Your own PEQ" : "Built-in Moondrop tuning")
-                        .disabled(!m.connected || m.busy)
-                }
-            }
+            PresetControl(labels: presets.map { $0 == 0 ? "Custom" : "\($0)" }, selected: m.preset) { m.select($0) }
+                .fixedSize()
+                .disabled(!m.connected || m.busy)
+            .help("Custom is your own PEQ; 1 to 5 are built-in Moondrop tunings")
 
             HStack {
                 if builtIn, let p = m.preset {
@@ -407,7 +461,9 @@ struct ContentView: View {
                     Text("Custom PEQ").font(.subheadline).foregroundStyle(.secondary)
                 }
                 Spacer()
-                Button("Reset flat") { m.resetFlat() }.disabled(!m.connected || m.bands.isEmpty || m.busy || builtIn)
+                Button("Reset") { m.resetStandard() }
+                    .disabled(!m.connected || m.bands.isEmpty || m.busy || builtIn)
+                    .help("Standard 9-band layout: 63 Hz to 16 kHz in octaves, Q 1.41, 0 dB")
             }
 
             ResponseGraph(bands: $m.bands, dragging: $m.dragging, fixed: builtIn ? m.live : nil, fs: m.sampleRate)
@@ -417,12 +473,14 @@ struct ContentView: View {
             Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 6) {
                 GridRow {
                     Text("")
-                    Text("Frequency").gridCellColumns(2)
-                    Text("Gain").gridCellColumns(2)
+                    Text("Frequency (Hz)").gridCellColumns(2)
+                    Text("Gain (dB)").gridCellColumns(2)
                     Text("Q").gridCellColumns(2)
                 }
                 .font(.caption.bold()).foregroundStyle(.secondary)
-                ForEach($m.bands) { $band in BandRow(band: $band) }
+                ForEach($m.bands) { $band in
+                    BandRow(band: $band, active: m.dragging.map { m.bands[$0].id } == band.id)
+                }
             }
             .disabled(!m.connected || m.busy || builtIn)
             .opacity(builtIn ? 0.35 : 1)
