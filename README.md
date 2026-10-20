@@ -23,11 +23,54 @@ It needs macOS 14 or newer and works on both Apple Silicon and Intel Macs.
 
 ## Using it
 
-Plug in the ECHO-B and open the app. You can switch between the Custom preset (0) and presets 1 to 5. Presets 1 to 5 are Moondrop's built-in tunings: the graph shows their real curve, read from the DSP, but they can't be edited. To edit the custom EQ, pick Custom and drag the dots on the graph or use the sliders.
+Plug in the ECHO-B and open the app. Most buttons and column headers have a tooltip if you hover over them.
 
-Nothing is sent to the dongle until you hit "Write to ECHO-B" (⌘S). "Revert" undoes your edits, and "Reset" puts the bands back on a standard 9-band layout (63 Hz to 16 kHz in octaves, Q 1.41, 0 dB). You can type exact values into the fields next to the sliders.
+### Presets
+
+The row at the top picks what the dongle plays:
+
+- **Custom** is your own 9-band EQ. It's the only one you can edit.
+- **1 to 5** are Moondrop's built-in tunings. Clicking one switches the dongle right away. The graph shows the real curve the dongle is running (read from the DSP), but you can't edit it. All five only cut, they never boost: 1 is a light treble trim, 2 and 3 pull down the mids and treble so the bass stands out, 4 scoops the mids, and 5 takes out bass and low mids so it sounds brighter.
+
+### Editing the Custom EQ
+
+Pick Custom, then either drag the dots on the graph (left/right is frequency, up/down is gain) or type values into the table. Each band has three settings:
+
+| Setting | What it does |
+|---|---|
+| Frequency (Hz) | The center of the band. Bass is below 250 Hz, mids are 250 Hz to 4 kHz, treble is above 4 kHz. |
+| Gain (dB) | How much that band is boosted (+) or cut (−), up to 12 dB, in whole dB steps. |
+| Q | How wide the band is. A low Q (0.5) is wide and gentle, a high Q (5 or more) is narrow and only touches a small range. 1.41 is exactly one octave. |
+
+Nothing is sent to the dongle until you hit **Write to ECHO-B** (⌘S), so you won't hear your edits until then. **Revert** throws away your edits. **Reset** puts every band back on a standard 9-band layout: 63, 125, 250, 500 Hz, 1, 2, 4, 8, 16 kHz, Q 1.41, all at 0 dB.
 
 Only peak filters work right now. Shelf, low pass, and high pass aren't supported yet.
+
+### Importing an EQ from squig.link or AutoEQ
+
+Sites like [squig.link](https://squig.link) (graph.hangout.audio, for example) and [AutoEQ](https://autoeq.app) can work out an EQ that makes your headphones or IEMs match a target such as Harman. To use one:
+
+1. On squig.link, pick your IEM and a target, open the Equalizer panel, run AutoEQ, and copy the Parametric EQ text. It looks like this:
+   ```
+   Preamp: -2.8 dB
+   Filter 1: ON PK Fc 35 Hz Gain 1.8 dB Q 0.500
+   Filter 2: ON PK Fc 100 Hz Gain -1.2 dB Q 2.000
+   ...
+   ```
+2. In the app, pick Custom and click **Paste EQ**.
+3. Check the curve, then **Write to ECHO-B**.
+
+The app takes up to 9 filters (the ECHO-B has 9 bands), skips filters marked OFF, and rounds gains to whole dB. It refuses EQs that use shelf filters (LSC/HSC) for now. squig.link's AutoEQ gives you peak filters, but AutoEQ's own files often start or end with a shelf.
+
+**Copy EQ** does the reverse: it copies your bands in the same format, so you can paste them into squig.link or Equalizer APO.
+
+### Preamp and clipping
+
+Songs are mastered close to the digital maximum (0 dB). If your EQ boosts anything above 0 dB, loud parts can clip and sound harsh or crackly. The preamp turns the whole signal down before the EQ to make room. It's −2.8 dB rather than −4.3 dB in the example above because neighbouring filters partly cancel each other out, so the summed curve only peaks at +2.8 dB.
+
+The **Preamp** field sits under the graph. Type a value (0 to −12 dB) or click **Auto** to set it to just enough that the highest point of the curve lands at 0 dB. Next to it, an orange "Peaks at +X dB, may clip" warning shows up if there still isn't enough room. Paste EQ takes the preamp from the file, but since gains get rounded to whole dB, it's worth clicking Auto afterwards.
+
+The ECHO-B doesn't have a preamp setting of its own, so the app builds it into band 1's filter coefficients, which means it runs inside the DSP and gets written along with the bands. When the app reads the EQ back, it works the preamp out from the coefficients the dongle is running. The official Android app doesn't know about this, so if you save from there, the preamp is gone.
 
 ## CLI
 
@@ -85,13 +128,13 @@ Don't send 446 with a slot other than 0. The dongle locks up and you have to rep
 
 446 returns whatever the DSP is running, so it's the only way to see what presets 1 to 5 actually do (477 only returns the Custom params). After switching presets, wait about half a second: reads made right away still return the old preset's coefficients. They're for the current sample rate, and param 62 returns its index using the same numbering as the slots.
 
-The device doesn't compute filters itself. You send it RBJ peaking biquads normalized by a0, stored as `[b0, b1, b2, -a1, -a2]`. Take `n = floor(log2(max|coef|)) + 1`, store each value as `round(coef * 2^(23-n))`, and send `n + 2` as the shift byte. A band with 0 dB gain is stored as `[2^22, 0, 0, 0, 0]` with shift 3.
+The device doesn't compute filters itself. You send it RBJ peaking biquads normalized by a0, stored as `[b0, b1, b2, -a1, -a2]`. Take `n = floor(log2(max|coef|)) + 1`, store each value as `round(coef * 2^(23-n))`, and send `n + 2` as the shift byte. A band with 0 dB gain is stored as `[2^22, 0, 0, 0, 0]` with shift 3. Shift 2 (n = 0) works too. The app uses it for the preamp, which scales band 1's `b0, b1, b2` by `10^(preamp/20)`.
 
 To save, I do what the app does:
 
 1. Send the params for each band and wait for each reply.
 2. Send the coefficients for each band in all 5 slots without waiting, except for the last one.
 3. Commit with `[255]`.
-4. Switch to preset 0 and commit again. Without this step the new coefficients don't actually load.
+4. Switch to another preset, then to preset 0 and commit again. The DSP only reloads coefficients when the mode actually changes, so switching to 0 while already on 0 doesn't load the new ones.
 
 Things that didn't work: WebHID can't do an input GET_REPORT, so a web version is out. The SPV, Comture, and Jiu protocols aren't the right ones for this chip. The firmware version command (259) just returns an error.
