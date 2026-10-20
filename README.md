@@ -23,7 +23,7 @@ It needs macOS 14 or newer and works on both Apple Silicon and Intel Macs.
 
 ## Using it
 
-Plug in the ECHO-B and open the app. You can switch between the Custom preset (0) and presets 1 to 5. To edit the custom EQ, drag the dots on the graph or use the sliders.
+Plug in the ECHO-B and open the app. You can switch between the Custom preset (0) and presets 1 to 5. Presets 1 to 5 are Moondrop's built-in tunings: the graph shows their real curve, read from the DSP, but they can't be edited. To edit the custom EQ, pick Custom and drag the dots on the graph or use the sliders.
 
 Nothing is sent to the dongle until you hit "Write to ECHO-B" (⌘S). "Revert" undoes your edits, and "Reset flat" sets every band back to 0 dB.
 
@@ -77,11 +77,13 @@ A frame is 62 bytes: `01 00`, then u32 LE `13 | cmd<<16`, then u32 LE `cafID("CT
 | 220 | `[0, band, freq, q·256, type, gain]` | save band params |
 | 220 | `[slot, band, shift, B0, B1, B2, -a1, -a2]` | save coefficients for one sample rate |
 | 220 | `[255]` | commit to flash |
-| 446 | `[0, band]` | read live coefficients |
+| 446 | `[0, band]` | read live coefficients: band @14, shift @18, `[B0, B1, B2, -a1, -a2]` @22 (24-bit) |
 
 Coefficient slots: 4 = 44.1k, 5 = 48k, 6 = 96k, 7 = 192k, 8 = 384k. Filter types: 0 peak, 1 low shelf, 2 high shelf, 3 low pass, 4 high pass.
 
 Don't send 446 with a slot other than 0. The dongle locks up and you have to replug it.
+
+446 returns whatever the DSP is running, so it's the only way to see what presets 1 to 5 actually do (477 only returns the Custom params). After switching presets, wait about half a second: reads made right away still return the old preset's coefficients. They're for the current sample rate, and param 62 returns its index using the same numbering as the slots.
 
 The device doesn't compute filters itself. You send it RBJ peaking biquads normalized by a0, stored as `[b0, b1, b2, -a1, -a2]`. Take `n = floor(log2(max|coef|)) + 1`, store each value as `round(coef * 2^(23-n))`, and send `n + 2` as the shift byte. A band with 0 dB gain is stored as `[2^22, 0, 0, 0, 0]` with shift 3.
 
