@@ -1,0 +1,5 @@
+.venv/
+__pycache__/
+.DS_Store
+ECHO-B.app/
+ECHO-B.zip
