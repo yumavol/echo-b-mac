@@ -16,7 +16,7 @@ let paramEQMode: UInt32 = 90
 let paramSampleRate: UInt32 = 62                // index matches slotRates numbering
 let slotRates: [(UInt32, Double)] = [(4, 44100), (5, 48000), (6, 96000), (7, 192000), (8, 384000)]
 let filterNames = [0: "Peak", 1: "Low shelf", 2: "High shelf", 3: "Low pass", 4: "High pass"]
-let gainRange = -12.0...12.0, freqRange = 20.0...20000.0, qRange = 0.2...10.0
+let gainRange = -12.0...12.0, freqRange = 20.0...20000.0, qRange = 0.2...10.0, preampRange = -12.0...0.0
 let standardFreqs = [63, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]
 let standardQ = (2.0.squareRoot() * 256).rounded() / 256     // device stores q·256
 
@@ -58,11 +58,12 @@ func peakCoeffs(_ fs: Double, _ freq: Double, _ q: Double, _ gain: Double) -> [D
 
 /// Device fixed point, matching the app's native EqDesignFx: 24-bit values scaled by 2^(23-n),
 /// n = smallest power of two above the largest coefficient, shift byte = n + 2, feedback stored negated.
-func deviceCoeffs(_ fs: Double, _ freq: Double, _ q: Double, _ gain: Double) -> (UInt32, [Int]) {
-    if gain == 0 { return (3, [1 << 22, 0, 0, 0, 0]) }      // device stores flat bands as identity
-    let c = peakCoeffs(fs, freq, q, gain)
-    let co = [c[0], c[1], c[2], -c[3], -c[4]]
-    let n = Int(floor(log2(co.map(abs).max()!))) + 1
+/// `preamp` (dB) scales the numerator: a broadband gain inside the DSP, the only preamp the device has.
+func deviceCoeffs(_ fs: Double, _ freq: Double, _ q: Double, _ gain: Double, preamp: Double = 0) -> (UInt32, [Int]) {
+    if gain == 0 && preamp == 0 { return (3, [1 << 22, 0, 0, 0, 0]) }      // device stores flat bands as identity
+    let c = peakCoeffs(fs, freq, q, gain), k = pow(10, preamp / 20)
+    let co = [c[0] * k, c[1] * k, c[2] * k, -c[3], -c[4]]
+    let n = max(0, Int(floor(log2(co.map(abs).max()!))) + 1)            // shift 2 is the lowest seen on the device
     let scale = pow(2.0, Double(23 - n))
     return (UInt32(n + 2), co.map { Int(($0 * scale).rounded()) })
 }
@@ -89,7 +90,53 @@ func responseDB(_ bands: [Band], at f: Double) -> Double {
     responseDB(bands.map { peakCoeffs(48000, Double($0.freq), $0.q, Double($0.gain)) }, at: f, fs: 48000)
 }
 
+/// Preamp savePEQ baked into band 1: what the DSP runs minus what the band params alone give.
+func derivedPreamp(_ bands: [Band], live: [[Double]], fs: Double) -> Double {
+    let params = bands.map { peakCoeffs(fs, Double($0.freq), $0.q, Double($0.gain)) }
+    let db = responseDB(live, at: 1000, fs: fs) - responseDB(params, at: 1000, fs: fs)
+    return ((db * 10).rounded() / 10).clamped(to: preampRange)
+}
+
 struct HIDError: Error, CustomStringConvertible { let description: String }
+
+typealias Filter = (freq: Double, gain: Double, q: Double)
+
+/// Parses Parametric EQ text as exported by squig.link, AutoEQ and Equalizer APO:
+/// `Preamp: -2.8 dB` and `Filter 1: ON PK Fc 35 Hz Gain 1.8 dB Q 0.500`. OFF filters are skipped.
+func parseEQ(_ text: String) throws -> (preamp: Double, filters: [Filter]) {
+    var preamp = 0.0, filters: [Filter] = []
+    for line in text.split(whereSeparator: \.isNewline) {
+        let t = line.split(whereSeparator: \.isWhitespace).map(String.init)
+        func value(after key: String) -> Double? {
+            t.firstIndex(of: key).flatMap { $0 + 1 < t.count ? Double(t[$0 + 1]) : nil }
+        }
+        if t.first == "Preamp:" { preamp = value(after: "Preamp:") ?? 0; continue }
+        guard t.first?.hasPrefix("Filter") == true, let on = t.firstIndex(of: "ON"), on + 1 < t.count else { continue }
+        guard ["PK", "PEQ"].contains(t[on + 1]) else {
+            throw HIDError(description: "\(t[on + 1]) filters (shelf / pass) aren't supported yet, only PK")
+        }
+        guard let f = value(after: "Fc"), let g = value(after: "Gain"), let q = value(after: "Q") else {
+            throw HIDError(description: "Can't read: \(line)")
+        }
+        filters.append((f, g, q))
+    }
+    guard !filters.isEmpty else { throw HIDError(description: "No Parametric EQ filters in the clipboard") }
+    guard filters.count <= 9 else { throw HIDError(description: "ECHO-B has 9 bands, this EQ has \(filters.count) active filters") }
+    return (preamp, filters)
+}
+
+/// Highest point of the summed curve, 20 Hz to 20 kHz. Above 0 dB the EQ can clip loud tracks.
+func peakDB(_ bands: [Band]) -> Double {
+    stride(from: 0.0, through: 3, by: 0.005).map { responseDB(bands, at: freqRange.lowerBound * pow(10, $0)) }.max() ?? 0
+}
+
+/// Same format back out.
+func exportEQ(_ bands: [Band], preamp: Double) -> String {
+    let lines = bands.enumerated().map { i, b in
+        String(format: "Filter %d: ON PK Fc %d Hz Gain %.1f dB Q %.3f", i + 1, b.freq, Double(b.gain), b.q)
+    }
+    return ([String(format: "Preamp: %.1f dB", preamp == 0 ? 0 : preamp)] + lines).joined(separator: "\n")
+}
 
 struct Band: Identifiable, Equatable {
     let id: Int
@@ -147,6 +194,13 @@ struct EchoB {
         usleep(500_000)
     }
 
+    /// The DSP only reloads coefficients on an actual mode change, so selecting 0 while on 0 isn't enough.
+    func reloadCustom() throws {
+        _ = try xfer(cmdSetParam, [paramEQMode, 1])
+        usleep(500_000)
+        try setPreset(0)
+    }
+
     func sampleRate() throws -> Double {
         let idx = UInt32(i32(try xfer(cmdGetParam, [paramSampleRate]), 14))
         return slotRates.first { $0.0 == idx }?.1 ?? 48000
@@ -161,7 +215,7 @@ struct EchoB {
     }
 
     /// Same sequence as the app's saveEQParamsToFlash(custom): params, coefficients per rate slot, commit.
-    func savePEQ(_ bands: [Band]) throws {
+    func savePEQ(_ bands: [Band], preamp: Double) throws {
         for b in bands {
             _ = try xfer(cmdSave, [0, UInt32(b.id), UInt32(b.freq), UInt32(Int(b.q * 256)), 0,
                                    UInt32(bitPattern: Int32(b.gain))])
@@ -169,7 +223,8 @@ struct EchoB {
         var writes: [[UInt32]] = []
         for b in bands {
             for (slot, fs) in slotRates {
-                let (shift, co) = deviceCoeffs(fs, Double(b.freq), Double(Int(b.q * 256)) / 256, Double(b.gain))
+                let (shift, co) = deviceCoeffs(fs, Double(b.freq), Double(Int(b.q * 256)) / 256, Double(b.gain),
+                                               preamp: b.id == bands.first?.id ? preamp : 0)
                 writes.append([slot, UInt32(b.id), shift] + co.map { UInt32(truncatingIfNeeded: $0) })
             }
         }
@@ -186,17 +241,21 @@ final class Model: ObservableObject {
     @Published var preset: Int?
     @Published var bands: [Band] = []
     @Published var savedBands: [Band] = []      // what the device currently holds
+    @Published var preamp = 0.0                 // dB, baked into band 1's coefficients on write
+    @Published var savedPreamp = 0.0
     @Published var live: [[Double]] = []        // active preset's curve as the DSP runs it
     @Published var sampleRate = 48000.0
     @Published var busy = false
     @Published var error: String?
+    @Published var notice: String?              // result of a paste / copy, cleared on the next device read
     @Published var dragging: Int?               // band dot being dragged in the graph
 
     private let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
     private let queue = DispatchQueue(label: "echob.hid")
     private var timer: Timer?
 
-    var dirty: Bool { bands != savedBands }
+    var dirty: Bool { bands != savedBands || preamp != savedPreamp }
+    var peak: Double { bands.isEmpty ? 0 : peakDB(bands) }
 
     init() {
         IOHIDManagerSetDeviceMatching(manager, [kIOHIDVendorIDKey: vendorID, kIOHIDProductIDKey: productID] as CFDictionary)
@@ -229,20 +288,53 @@ final class Model: ObservableObject {
     /// Writes the edited Custom PEQ to flash and switches to it.
     func write() {
         guard connected, dirty else { return }
-        let snapshot = bands
+        let snapshot = bands, pre = preamp
         run {
-            try $0.savePEQ(snapshot)
-            try $0.setPreset(0)
+            try $0.savePEQ(snapshot, preamp: pre)
+            try $0.reloadCustom()
         }
     }
 
-    func revert() { bands = savedBands }
+    func revert() { bands = savedBands; preamp = savedPreamp }
+
+    /// Just enough preamp that the loudest boost lands at 0 dB.
+    func autoPreamp() { preamp = (-(peak * 10).rounded(.up) / 10).clamped(to: preampRange) }
 
     /// Standard 9-band graphic EQ layout: ISO 266 octave centers, one-octave bandwidth (Q √2), 0 dB.
     func resetStandard() {
         for (i, f) in zip(bands.indices, standardFreqs) {
             (bands[i].freq, bands[i].q, bands[i].gain) = (f, standardQ, 0)
         }
+        preamp = 0
+    }
+
+    /// Loads Parametric EQ text from the clipboard into the bands (not written until Write).
+    func pasteEQ() {
+        do {
+            let eq = try parseEQ(NSPasteboard.general.string(forType: .string) ?? "")
+            resetStandard()
+            for (i, f) in zip(bands.indices, eq.filters.sorted { $0.freq < $1.freq }) {
+                bands[i].freq = Int(f.freq.rounded()).clamped(to: Int(freqRange.lowerBound)...Int(freqRange.upperBound))
+                // ponytail: device params hold whole dB as far as we know; try fractional gain if the 220 format allows it
+                bands[i].gain = Int(f.gain.rounded()).clamped(to: Int(gainRange.lowerBound)...Int(gainRange.upperBound))
+                bands[i].q = (f.q.clamped(to: qRange) * 256).rounded() / 256
+            }
+            preamp = ((eq.preamp * 10).rounded() / 10).clamped(to: preampRange)
+            var notes = ["Pasted \(eq.filters.count) filters. Check the curve, then Write to ECHO-B."]
+            if eq.filters.contains(where: { $0.gain != $0.gain.rounded() }) {
+                notes.append("Gains rounded to whole dB, so the peak moved a little: Auto refits the preamp.")
+            }
+            notice = notes.joined(separator: " ")
+            error = nil
+        } catch {
+            self.error = "\(error)"
+        }
+    }
+
+    func copyEQ() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(exportEQ(bands, preamp: preamp), forType: .string)
+        notice = "Copied as Parametric EQ text (squig.link, AutoEQ, Equalizer APO)."
     }
 
     // Runs a device action off the main thread, then re-reads state.
@@ -263,7 +355,11 @@ final class Model: ObservableObject {
                     self.savedBands = bands
                     self.live = live
                     self.sampleRate = fs
+                    // Custom's preamp only shows in its live coefficients; under a preset they're the preset's
+                    self.savedPreamp = mode == 0 ? derivedPreamp(bands, live: live, fs: fs) : 0
+                    self.preamp = self.savedPreamp
                     self.error = nil
+                    self.notice = nil
                 case .failure(let e): self.error = "\(e)"
                 }
             }
@@ -278,6 +374,7 @@ struct ResponseGraph: View {
     @Binding var dragging: Int?
     var fixed: [[Double]]? = nil                // read-only curve (built-in preset) instead of the editable bands
     var fs = 48000.0
+    var preamp = 0.0
 
     private func px(_ f: Double, _ w: Double) -> Double { log10(f / freqRange.lowerBound) / 3 * w }
     private func fx(_ x: Double, _ w: Double) -> Double {
@@ -305,7 +402,7 @@ struct ResponseGraph: View {
                 var curve = Path()
                 for sx in stride(from: 0.0, through: w, by: 2) {
                     let f = fx(sx, w)
-                    let db = min(max(fixed.map { responseDB($0, at: f, fs: fs) } ?? responseDB(bands, at: f), -13), 13)
+                    let db = min(max(fixed.map { responseDB($0, at: f, fs: fs) } ?? responseDB(bands, at: f) + preamp, -13), 13)
                     let pt = CGPoint(x: sx, y: py(db, h))
                     if sx == 0 { curve.move(to: pt) } else { curve.addLine(to: pt) }
                 }
@@ -321,13 +418,18 @@ struct ResponseGraph: View {
                     if dragging == i { ctx.stroke(dot, with: .color(.white), lineWidth: 2) }
                     ctx.draw(Text("\(b.id)").font(.system(size: 9, weight: .bold)).foregroundStyle(.white), at: c)
                 }
+                for (name, f) in [("Bass", 70.0), ("Mids", 1000), ("Treble", 9000)] {   // < 250 Hz, 250 Hz–4 kHz, > 4 kHz
+                    ctx.draw(Text(name).font(.caption2).foregroundStyle(.tertiary), at: CGPoint(x: px(f, w), y: 12))
+                }
                 if let i = dragging, fixed == nil, bands.indices.contains(i) {
                     let b = bands[i]
                     ctx.draw(Text("Band \(b.id) · \(hz(b.freq)) Hz · \(b.gain > 0 ? "+" : "")\(b.gain) dB · Q \(String(format: "%.2f", b.q))")
                                 .font(.caption.monospacedDigit()).foregroundStyle(.secondary),
-                             at: CGPoint(x: w / 2, y: 12))
+                             at: CGPoint(x: w / 2, y: 30))
                 }
             }
+            .help(fixed == nil ? "Drag a dot: left/right moves its frequency, up/down sets its gain. Set the width (Q) in the table below."
+                               : "The curve this built-in preset applies, read from the ECHO-B")
             .contentShape(Rectangle())
             .gesture(DragGesture(minimumDistance: 0)
                 .onChanged { g in
@@ -388,6 +490,7 @@ struct BandRow: View {
     var body: some View {
         GridRow {
             Text("\(band.id)").font(.callout.bold()).foregroundStyle(active ? Color.accentColor : .secondary)
+                .help("Band \(band.id), the same number as its dot on the graph")
             Slider(value: logFreq, in: log10(freqRange.lowerBound)...log10(freqRange.upperBound))
             field(freqField, IntegerFormatStyle<Int>().grouping(.never), width: 62)
             Slider(value: gain, in: gainRange)
@@ -403,6 +506,7 @@ struct BandRow: View {
 /// SwiftUI's segmented Picker makes every segment as wide as "Custom"; this one fits each label.
 struct PresetControl: NSViewRepresentable {
     let labels: [String]
+    let tooltips: [String]
     var selected: Int?
     let onSelect: (Int) -> Void
 
@@ -411,6 +515,7 @@ struct PresetControl: NSViewRepresentable {
                                    target: context.coordinator, action: #selector(Coordinator.changed(_:)))
         c.segmentDistribution = .fit
         for i in labels.indices.dropFirst() { c.setWidth(34, forSegment: i) }
+        for (i, tip) in tooltips.enumerated() { c.setToolTip(tip, forSegment: i) }
         return c
     }
 
@@ -434,6 +539,9 @@ struct ContentView: View {
     // ponytail: preset count unknown (names live on Moondrop's cloud); 0...5 shown, device rejects invalid ones
     private let presets = 0...5
     private var builtIn: Bool { (m.preset ?? 0) != 0 }
+    private var preampField: Binding<Double> {
+        Binding(get: { m.preamp }, set: { m.preamp = (($0 * 10).rounded() / 10).clamped(to: preampRange) })
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -447,10 +555,12 @@ struct ContentView: View {
                     .help("Re-read device")
             }
 
-            PresetControl(labels: presets.map { $0 == 0 ? "Custom" : "\($0)" }, selected: m.preset) { m.select($0) }
+            PresetControl(labels: presets.map { $0 == 0 ? "Custom" : "\($0)" },
+                          tooltips: presets.map { $0 == 0 ? "Your own 9-band EQ, editable below"
+                                                          : "Built-in Moondrop tuning \($0), read-only. Switches right away." },
+                          selected: m.preset) { m.select($0) }
                 .fixedSize()
                 .disabled(!m.connected || m.busy)
-            .help("Custom is your own PEQ; 1 to 5 are built-in Moondrop tunings")
 
             HStack {
                 if builtIn, let p = m.preset {
@@ -461,21 +571,53 @@ struct ContentView: View {
                     Text("Custom PEQ").font(.subheadline).foregroundStyle(.secondary)
                 }
                 Spacer()
+                Button("Paste EQ") { m.pasteEQ() }
+                    .disabled(!m.connected || m.bands.isEmpty || m.busy || builtIn)
+                    .help("Paste Parametric EQ text from squig.link or AutoEQ (PK filters, up to 9)")
+                Button("Copy EQ") { m.copyEQ() }
+                    .disabled(m.bands.isEmpty || builtIn)
+                    .help("Copy the bands as Parametric EQ text")
                 Button("Reset") { m.resetStandard() }
                     .disabled(!m.connected || m.bands.isEmpty || m.busy || builtIn)
                     .help("Standard 9-band layout: 63 Hz to 16 kHz in octaves, Q 1.41, 0 dB")
             }
 
-            ResponseGraph(bands: $m.bands, dragging: $m.dragging, fixed: builtIn ? m.live : nil, fs: m.sampleRate)
+            ResponseGraph(bands: $m.bands, dragging: $m.dragging, fixed: builtIn ? m.live : nil, fs: m.sampleRate, preamp: m.preamp)
                 .frame(height: 200)
                 .disabled(!m.connected || m.bands.isEmpty || m.busy || builtIn)
+
+            HStack(spacing: 6) {
+                Text("Preamp").font(.callout).foregroundStyle(.secondary)
+                TextField("", value: preampField, format: FloatingPointFormatStyle<Double>().precision(.fractionLength(1)))
+                    .textFieldStyle(.roundedBorder).multilineTextAlignment(.trailing).frame(width: 56)
+                Text("dB").font(.callout).foregroundStyle(.secondary)
+                Button("Auto") { m.autoPreamp() }
+                    .help("Set the preamp so the highest point of the curve lands at 0 dB")
+                let headroom = m.peak + m.preamp
+                if headroom > 0.1 {
+                    Label(String(format: "Peaks at +%.1f dB, may clip", headroom), systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption).foregroundStyle(.orange)
+                } else if m.peak > 0.1 {
+                    Label("No clipping", systemImage: "checkmark.circle").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            .help("""
+                Turns the whole signal down before the EQ. Songs are mastered close to the digital maximum (0 dB), \
+                so any boost above 0 dB can distort loud parts. Set the preamp to minus the peak (or click Auto) \
+                to make room. It's applied inside the ECHO-B's DSP, so it's written along with the bands.
+                """)
+            .disabled(!m.connected || m.bands.isEmpty || m.busy || builtIn)
+            .opacity(builtIn ? 0.35 : 1)
 
             Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 6) {
                 GridRow {
                     Text("")
                     Text("Frequency (Hz)").gridCellColumns(2)
+                        .help("Center of the band. Bass is below 250 Hz, mids 250 Hz to 4 kHz, treble above 4 kHz.")
                     Text("Gain (dB)").gridCellColumns(2)
+                        .help("How much the band is boosted (+) or cut (−), up to 12 dB. Whole dB steps.")
                     Text("Q").gridCellColumns(2)
+                        .help("Width of the band. Low Q (0.5) is wide and gentle, high Q (5+) is narrow and surgical. 1.41 covers one octave.")
                 }
                 .font(.caption.bold()).foregroundStyle(.secondary)
                 ForEach($m.bands) { $band in
@@ -490,12 +632,15 @@ struct ContentView: View {
                     .font(.caption).foregroundStyle(m.dirty ? Color.orange : Color.secondary)
                 Spacer()
                 Button("Revert") { m.revert() }.disabled(!m.dirty || m.busy)
+                    .help("Throw away edits and go back to what the ECHO-B has")
                 Button("Write to ECHO-B") { m.write() }
+                    .help("Save the bands to the dongle's flash and switch to Custom (⌘S). Edits aren't heard until then.")
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut("s", modifiers: .command)
                     .disabled(!m.connected || !m.dirty || m.busy)
             }
             if let e = m.error { Text(e).font(.callout).foregroundStyle(.red) }
+            if let n = m.notice { Text(n).font(.callout).foregroundStyle(.secondary) }
         }
         .padding(20)
         .frame(width: 720)
@@ -517,6 +662,23 @@ func selfTest() {
     // live coefficient decode must round-trip the encoder (negative words arrive as 24-bit)
     let (s6, c6) = deviceCoeffs(96000, 1000, 1, -6)
     precondition(abs(responseDB([biquad(Int(s6), c6.map { $0 & 0xFFFFFF })], at: 1000, fs: 96000) + 6) < 0.05)
+    // squig.link export (Harman IE 2019 target): OFF filter skipped, shelves rejected, export parses back
+    let squig = try! parseEQ("""
+        Preamp: -2.8 dB
+        Filter 1: ON PK Fc 35 Hz Gain 1.8 dB Q 0.500
+        Filter 9: ON PK Fc 15000 Hz Gain -10.4 dB Q 2.000
+        Filter 10: OFF PK Fc 0 Hz Gain 0.0 dB Q 0.000
+        """)
+    precondition(squig.preamp == -2.8 && squig.filters.count == 2 && squig.filters[0] == (35, 1.8, 0.5))
+    precondition((try? parseEQ("Filter 1: ON LSC Fc 105 Hz Gain 5.5 dB Q 0.70")) == nil)
+    let boosted = [Band(id: 1, freq: 1000, q: 1, gain: 6, type: "Peak")]
+    let back = try! parseEQ(exportEQ(boosted, preamp: -6))
+    precondition(back.preamp == -6 && back.filters[0] == (1000, 6, 1))
+    // preamp baked into a flat band is a pure broadband gain, and can be read back off the live curve
+    let (sp, cp) = deviceCoeffs(48000, 1000, 1, 0, preamp: -12)
+    let live = [biquad(Int(sp), cp.map { $0 & 0xFFFFFF })]
+    precondition(abs(responseDB(live, at: 5000, fs: 48000) + 12) < 0.01)
+    precondition(derivedPreamp([Band(id: 1, freq: 1000, q: 1, gain: 0, type: "Peak")], live: live, fs: 48000) == -12)
     print("selftest ok")
 }
 
