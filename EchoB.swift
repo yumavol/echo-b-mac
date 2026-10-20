@@ -11,7 +11,9 @@ let cmdSetParam: UInt32 = 90                    // data [90, index]
 let cmdGetParam: UInt32 = 346                   // data [param]
 let cmdGetPEQBand: UInt32 = 477                 // data [band 1...9]
 let cmdSave: UInt32 = 220                       // data [slot, ...] / [255] commits to flash
+let cmdGetLiveCoeffs: UInt32 = 446              // data [0, band]; slot must be 0, others hang the device
 let paramEQMode: UInt32 = 90
+let paramSampleRate: UInt32 = 62                // index matches slotRates numbering
 let slotRates: [(UInt32, Double)] = [(4, 44100), (5, 48000), (6, 96000), (7, 192000), (8, 384000)]
 let filterNames = [0: "Peak", 1: "Low shelf", 2: "High shelf", 3: "Low pass", 4: "High pass"]
 let gainRange = -12.0...12.0, freqRange = 20.0...20000.0, qRange = 0.2...10.0
@@ -61,16 +63,26 @@ func deviceCoeffs(_ fs: Double, _ freq: Double, _ q: Double, _ gain: Double) -> 
     return (UInt32(n + 2), co.map { Int(($0 * scale).rounded()) })
 }
 
-/// Summed magnitude response of all bands in dB (display only, 48 kHz).
-func responseDB(_ bands: [Band], at f: Double) -> Double {
-    let fs = 48000.0, w = 2 * Double.pi * f / fs
+/// Inverse of deviceCoeffs: device fixed point back to normalized [b0, b1, b2, a1, a2].
+func biquad(_ shift: Int, _ co: [Int]) -> [Double] {
+    let c = co.map { Double(s24($0)) / pow(2, Double(25 - shift)) }
+    return [c[0], c[1], c[2], -c[3], -c[4]]
+}
+
+/// Summed magnitude response in dB of normalized biquads [b0, b1, b2, a1, a2].
+func responseDB(_ biquads: [[Double]], at f: Double, fs: Double) -> Double {
+    let w = 2 * Double.pi * f / fs
     let cw = cos(w), sw = sin(w), c2 = cos(2 * w), s2 = sin(2 * w)
-    return bands.reduce(0) { sum, b in
-        let c = peakCoeffs(fs, Double(b.freq), b.q, Double(b.gain))
+    return biquads.reduce(0) { sum, c in
         let nr = c[0] + c[1] * cw + c[2] * c2, ni = -(c[1] * sw + c[2] * s2)
         let dr = 1 + c[3] * cw + c[4] * c2, di = -(c[3] * sw + c[4] * s2)
         return sum + 10 * log10((nr * nr + ni * ni) / (dr * dr + di * di))
     }
+}
+
+/// Custom PEQ response (display only, 48 kHz).
+func responseDB(_ bands: [Band], at f: Double) -> Double {
+    responseDB(bands.map { peakCoeffs(48000, Double($0.freq), $0.q, Double($0.gain)) }, at: f, fs: 48000)
 }
 
 struct HIDError: Error, CustomStringConvertible { let description: String }
@@ -127,6 +139,21 @@ struct EchoB {
     func setPreset(_ index: Int) throws {
         _ = try xfer(cmdSetParam, [paramEQMode, UInt32(index)])     // also makes the DSP reload coefficients
         _ = try xfer(cmdSave, [255])
+        // ponytail: fixed wait for the async DSP reload (reads right after return the old preset); poll if it ever flakes
+        usleep(500_000)
+    }
+
+    func sampleRate() throws -> Double {
+        let idx = UInt32(i32(try xfer(cmdGetParam, [paramSampleRate]), 14))
+        return slotRates.first { $0.0 == idx }?.1 ?? 48000
+    }
+
+    /// Biquads the DSP is running right now, i.e. the active preset's real curve.
+    func liveBiquads() throws -> [[Double]] {
+        try (1...9).map { band in
+            let r = try xfer(cmdGetLiveCoeffs, [0, UInt32(band)])
+            return biquad(i32(r, 18), (0..<5).map { i32(r, 22 + 4 * $0) })
+        }
     }
 
     /// Same sequence as the app's saveEQParamsToFlash(custom): params, coefficients per rate slot, commit.
@@ -155,6 +182,8 @@ final class Model: ObservableObject {
     @Published var preset: Int?
     @Published var bands: [Band] = []
     @Published var savedBands: [Band] = []      // what the device currently holds
+    @Published var live: [[Double]] = []        // active preset's curve as the DSP runs it
+    @Published var sampleRate = 48000.0
     @Published var busy = false
     @Published var error: String?
     @Published var dragging: Int?               // band dot being dragged in the graph
@@ -186,7 +215,7 @@ final class Model: ObservableObject {
         let present = device() != nil
         guard present != connected else { return }
         connected = present
-        if present { refresh() } else { preset = nil; bands = []; savedBands = []; error = nil }
+        if present { refresh() } else { preset = nil; bands = []; savedBands = []; live = []; error = nil }
     }
 
     func refresh() { run { _ in } }
@@ -214,17 +243,19 @@ final class Model: ObservableObject {
         guard let dev = device(), !busy else { return }
         busy = true
         queue.async {
-            let result = Result { () -> (Int, [Band]) in
+            let result = Result { () -> (Int, [Band], [[Double]], Double) in
                 try action(dev)
-                return (try dev.eqMode(), try dev.peqBands())
+                return (try dev.eqMode(), try dev.peqBands(), try dev.liveBiquads(), try dev.sampleRate())
             }
             DispatchQueue.main.async {
                 self.busy = false
                 switch result {
-                case .success(let (mode, bands)):
+                case .success(let (mode, bands, live, fs)):
                     self.preset = mode
                     self.bands = bands
                     self.savedBands = bands
+                    self.live = live
+                    self.sampleRate = fs
                     self.error = nil
                 case .failure(let e): self.error = "\(e)"
                 }
@@ -238,6 +269,8 @@ final class Model: ObservableObject {
 struct ResponseGraph: View {
     @Binding var bands: [Band]
     @Binding var dragging: Int?
+    var fixed: [[Double]]? = nil                // read-only curve (built-in preset) instead of the editable bands
+    var fs = 48000.0
 
     private func px(_ f: Double, _ w: Double) -> Double { log10(f / freqRange.lowerBound) / 3 * w }
     private func fx(_ x: Double, _ w: Double) -> Double {
@@ -263,12 +296,13 @@ struct ResponseGraph: View {
                 }
                 var curve = Path()
                 for sx in stride(from: 0.0, through: w, by: 2) {
-                    let db = min(max(responseDB(bands, at: fx(sx, w)), -13), 13)
+                    let f = fx(sx, w)
+                    let db = min(max(fixed.map { responseDB($0, at: f, fs: fs) } ?? responseDB(bands, at: f), -13), 13)
                     let pt = CGPoint(x: sx, y: py(db, h))
                     if sx == 0 { curve.move(to: pt) } else { curve.addLine(to: pt) }
                 }
                 ctx.stroke(curve, with: .color(.accentColor), lineWidth: 2)
-                for (i, b) in bands.enumerated() {
+                for (i, b) in bands.enumerated() where fixed == nil {
                     let c = CGPoint(x: px(Double(b.freq), w), y: py(Double(b.gain), h))
                     let r: Double = dragging == i ? 9 : 7
                     let dot = Path(ellipseIn: CGRect(x: c.x - r, y: c.y - r, width: 2 * r, height: 2 * r))
@@ -339,6 +373,7 @@ struct ContentView: View {
     @StateObject private var m = Model()
     // ponytail: preset count unknown (names live on Moondrop's cloud); 0...5 shown, device rejects invalid ones
     private let presets = 0...5
+    private var builtIn: Bool { (m.preset ?? 0) != 0 }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -358,22 +393,26 @@ struct ContentView: View {
                     Button { m.select(i) } label: { Text(i == 0 ? "Custom" : "\(i)").frame(minWidth: 40) }
                         .buttonStyle(.borderedProminent)
                         .tint(i == m.preset ? .accentColor : .gray.opacity(0.35))
+                        .help(i == 0 ? "Your own PEQ" : "Built-in Moondrop tuning")
                         .disabled(!m.connected || m.busy)
                 }
             }
 
             HStack {
-                Text("Custom PEQ").font(.subheadline).foregroundStyle(.secondary)
-                if let p = m.preset, p != 0 {
-                    Text("· preset \(p) active, editing switches to Custom").font(.caption).foregroundStyle(.secondary)
+                if builtIn, let p = m.preset {
+                    Text("Preset \(p)").font(.subheadline).foregroundStyle(.secondary)
+                    Text("· built-in Moondrop tuning, read-only. Pick Custom to make your own.")
+                        .font(.caption).foregroundStyle(.secondary)
+                } else {
+                    Text("Custom PEQ").font(.subheadline).foregroundStyle(.secondary)
                 }
                 Spacer()
-                Button("Reset flat") { m.resetFlat() }.disabled(!m.connected || m.bands.isEmpty || m.busy)
+                Button("Reset flat") { m.resetFlat() }.disabled(!m.connected || m.bands.isEmpty || m.busy || builtIn)
             }
 
-            ResponseGraph(bands: $m.bands, dragging: $m.dragging)
+            ResponseGraph(bands: $m.bands, dragging: $m.dragging, fixed: builtIn ? m.live : nil, fs: m.sampleRate)
                 .frame(height: 200)
-                .disabled(!m.connected || m.bands.isEmpty || m.busy)
+                .disabled(!m.connected || m.bands.isEmpty || m.busy || builtIn)
 
             Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 6) {
                 GridRow {
@@ -385,7 +424,8 @@ struct ContentView: View {
                 .font(.caption.bold()).foregroundStyle(.secondary)
                 ForEach($m.bands) { $band in BandRow(band: $band) }
             }
-            .disabled(!m.connected || m.busy)
+            .disabled(!m.connected || m.busy || builtIn)
+            .opacity(builtIn ? 0.35 : 1)
 
             HStack {
                 Text(m.dirty ? "Unsaved changes" : "In sync with ECHO-B")
@@ -416,6 +456,9 @@ func selfTest() {
     precondition(shift == 3 && zip(co, ref).allSatisfy { abs($0 - $1) <= 2 })
     precondition(deviceCoeffs(48000, 1000, 0.7, 0) == (3, [1 << 22, 0, 0, 0, 0]))
     precondition(abs(responseDB([Band(id: 1, freq: 1000, q: 1, gain: 6, type: "Peak")], at: 1000) - 6) < 0.01)
+    // live coefficient decode must round-trip the encoder (negative words arrive as 24-bit)
+    let (s6, c6) = deviceCoeffs(96000, 1000, 1, -6)
+    precondition(abs(responseDB([biquad(Int(s6), c6.map { $0 & 0xFFFFFF })], at: 1000, fs: 96000) + 6) < 0.05)
     print("selftest ok")
 }
 
