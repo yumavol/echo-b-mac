@@ -25,7 +25,7 @@ It needs macOS 14 or newer and works on both Apple Silicon and Intel Macs.
 
 Plug in the ECHO-B and open the app. You can switch between the Custom preset (0) and presets 1 to 5. Presets 1 to 5 are Moondrop's built-in tunings: the graph shows their real curve, read from the DSP, but they can't be edited. To edit the custom EQ, pick Custom and drag the dots on the graph or use the sliders.
 
-Nothing is sent to the dongle until you hit "Write to ECHO-B" (⌘S). "Revert" undoes your edits, and "Reset flat" sets every band back to 0 dB.
+Nothing is sent to the dongle until you hit "Write to ECHO-B" (⌘S). "Revert" undoes your edits, and "Reset" puts the bands back on a standard 9-band layout (63 Hz to 16 kHz in octaves, Q 1.41, 0 dB). You can type exact values into the fields next to the sliders.
 
 Only peak filters work right now. Shelf, low pass, and high pass aren't supported yet.
 
